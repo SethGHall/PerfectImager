@@ -8,6 +8,7 @@ CONFIG_DIR=${PROJECT_DIR}/configs
 
 GLEAM_SMALL=${CONFIG_DIR}/gleam_small.yaml
 GAUSSIAN=${CONFIG_DIR}/gaussian.yaml
+VLA=${CONFIG_DIR}/vla.yaml
 
 case ${COMMAND} in
 
@@ -17,17 +18,29 @@ case ${COMMAND} in
         mkdir build
         cd build && cmake ..
         make -j8
-        ./direct_imaging ${GLEAM_SMALL}
+        ./perfect_imager ${GLEAM_SMALL}
         cd ${PROJECT_DIR}
     ;;
 	
+
+    build_and_run_vla)
+        cd ${PROJECT_DIR} 
+        rm -rf build
+        mkdir build
+        cd build && cmake ..
+        make -j8
+        ./perfect_imager ${VLA}
+        cd ${PROJECT_DIR}
+    ;;
+
+
 	build_and_run_gaussian)
         cd ${PROJECT_DIR} 
         rm -rf build
         mkdir build
         cd build && cmake ..
         make -j8
-        ./direct_imaging ${GAUSSIAN}
+        ./perfect_imager ${GAUSSIAN}
         cd ${PROJECT_DIR}
     ;;
 
@@ -36,4 +49,3 @@ case ${COMMAND} in
     ;;
 
 esac
-

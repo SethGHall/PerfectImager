@@ -1,6 +1,7 @@
+cmake_minimum_required(VERSION 3.10.2)
 
 #! Base inverse direct fourier transform project
-project(perfect_imager CXX CUDA)
+project(perfect_imager C CXX CUDA)
 
 #! Flags for the compiler
 if ("${CMAKE_C_COMPILER_ID}" MATCHES ".*Clang.*" OR "${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
@@ -33,4 +34,8 @@ cuda_add_executable(
 	main.cpp
 	src/inverse_direct_fourier_transform.cu
 )
+set_target_properties(perfect_imager PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 target_link_libraries(perfect_imager m fyaml-0.5)
+
+target_include_directories(perfect_imager PUBLIC .)

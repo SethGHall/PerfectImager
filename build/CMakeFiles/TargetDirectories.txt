@@ -1,0 +1,3 @@
+/home/seth/perfectimager/PerfectImager/build/CMakeFiles/perfect_imager.dir
+/home/seth/perfectimager/PerfectImager/build/CMakeFiles/edit_cache.dir
+/home/seth/perfectimager/PerfectImager/build/CMakeFiles/rebuild_cache.dir
