@@ -41,54 +41,28 @@ int main(int argc, char **argv)
 	printf(">>> AUT HPC Research Laboratory - Inverse Direct Fourier Transform (CUDA) <<<\n");
 	printf("=============================================================================\n\n");
 
+	if(argc < 2)
+	{
+		printf("Error: double check you are providing yaml config file...\n\n");
+		exit(EXIT_FAILURE);
+	}
+
 	//initialize config struct
 	Config config;
-	init_config(&config);
+	init_config_from_yaml(&config, argv[1]);
 
-	//allocate the grid or image of size render_size squared.. Each element is a Complex type
-	printf(">>> UPDATE: Allocating Image (grid), size = %d by %d as flat memory..\n\n",
-			config.render_size,config.render_size);
-	Complex *grid = (Complex*) calloc(config.render_size*config.render_size,sizeof(Complex));
+	PRECISION *h_image = (PRECISION*) calloc(config.render_size*config.render_size, sizeof(PRECISION));
+	VIS_PRECISION2 *h_visibilities = (VIS_PRECISION2*) calloc(config.num_visibilities, sizeof(VIS_PRECISION2));
+	PRECISION3 *h_uvw_coords = (PRECISION3*) calloc(config.num_uvw_coords, sizeof(PRECISION3));
+	
+	
+	load_visibilities(&config, h_visibilities, h_uvw_coords);
 
-	if(grid == NULL)
-	{	
-		printf(">>> ERROR: Unable to allocate grid memory \n");
-		return EXIT_FAILURE;
-	}
-
-	//Try to load visibilities from file and their intensities
-	Visibility *visibilities = NULL;
-	Complex *vis_intensity = NULL;
-	load_visibilities(&config, &visibilities, &vis_intensity);
-
-	if(visibilities == NULL || vis_intensity == NULL)
-	{	
-		printf(">>> ERROR: Visibility memory was unable to be allocated \n\n");
-		if(visibilities)      free(visibilities);
-		if(vis_intensity)      free(vis_intensity);
-		if(grid)			  free(grid);
-		return EXIT_FAILURE;
-	}
-
-	struct timeval begin;
-	gettimeofday(&begin,0);
-
-	// Perform inverse direct fourier transform to 
-	// obtain sources from visibilities (as image)
-	create_perfect_image(&config, grid, visibilities, vis_intensity);
-
-	struct timeval end;
-	gettimeofday(&end,0);
-	float time_diff = time_difference_msec(begin,end);
-	printf(">>> UPDATE: Inverse DFT complete, time taken: %f milliseconds or %f seconds...\n\n",time_diff, time_diff/1000);
-	printf(">>> UPDATE: Saving rendered portion of image to file... %s\n\n", config.output_image_file);
-    save_grid_to_file(&config, grid);
+	create_image(&config, h_image, h_visibilities, h_uvw_coords);
 
     // Clean up
-    if(visibilities)      free(visibilities);
-	if(vis_intensity)      free(vis_intensity);
-	if(grid)			  free(grid);
-
-    printf(">>> UPDATE: Inverse Direct Fourier Transform operations complete, exiting...\n\n");
+    free(h_uvw_coords);
+	free(h_visibilities);
+	free(h_image);
 	return EXIT_SUCCESS;
 }

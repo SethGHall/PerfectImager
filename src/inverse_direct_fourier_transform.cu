@@ -28,6 +28,9 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+
+//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
+
 #include <cstdlib>
 #include <cstdio>
 #include <cfloat>
@@ -39,7 +42,7 @@
 #include <cuda_runtime_api.h>
 #include <device_launch_parameters.h>
 
-#include "inverse_direct_fourier_transform.h"
+#include "../inverse_direct_fourier_transform.h"
 
 /**
  * Check the return value of the CUDA runtime API call and exit
@@ -57,259 +60,305 @@ static void check_cuda_error_aux(const char *file, unsigned line, const char *st
 /*
  * Intialize the configuration struct - IMPORTANT observation parameters
  */
-void init_config(Config *config)
-{	
-	printf(">>> UPDATE: Loading configuration...\n\n");
+void init_config_from_yaml(Config *config, char* yaml_file)
+{
+	// Parse YAML document into config struct
+	struct fy_document *fyd = NULL;
+	fyd = fy_document_build_from_file(NULL, yaml_file);
 
-	// Output files with paths for the resulting image, seperating real and imaginary components
-	config->output_image_file      = "../GLEAM_small_perfect.csv";
+	if(!fyd)
+	{
+		printf("Error: Unable to locate your yaml file...\n\n");
+		exit(EXIT_FAILURE);
+	}
 
-	// Visibility Source file for the iDFT 
-	config->vis_file               = "../GLEAM_small_visibilities.csv"; 
+	uint32_t num_receivers = 0;
+	parse_config_attribute(fyd, "NUM_RECEIVERS", "%d", &num_receivers);
+	parse_config_attribute(fyd, "IMAGE_SIZE", "%d", &(config->image_size));
+	
+	parse_config_attribute(fyd, "FREQUENCY_NUM_CHANNELS", "%d", &(config->num_channels));
+	parse_config_attribute(fyd, "NUM_TIMESTEPS", "%d", &(config->num_timesteps));
+	parse_config_attribute(fyd, "TIMESTEP_BATCH_SIZE", "%d", &(config->ts_batch_size));
 
-	// Flag to enable Point Spread Function
-	config->psf_enabled            = false;
+	parse_config_attribute(fyd, "FOV_DEG", "%lf", &(config->fov_deg));
+	parse_config_attribute(fyd, "FREQUENCY_START_HZ", "%lf", &(config->frequency_hz_start));
+	parse_config_attribute(fyd, "FREQUENCY_BANDWIDTH", "%lf", &(config->frequency_bandwidth));
+	parse_config_attribute_bool(fyd, "RIGHT_ASCENSION", "%d", &(config->right_ascension));
+	parse_config_attribute(fyd, "VIS_INTENSITY_FILE", "%s", &(config->visibility_source_file));
+	parse_config_attribute(fyd, "VIS_UVW_FILE", "%s", &(config->uvw_source_file));
+	parse_config_attribute(fyd, "INPUT_DATA_PATH", "%s", &(config->data_input_path));
+	parse_config_attribute(fyd, "OUTPUT_DATA_PATH", "%s", &(config->data_output_path));
 
-	// Frequency of visibility uvw terms in hertz 
-	config->frequency_hz           = C; //100e6;
+	
 
-	// specify single cell size in radians
-	config->cell_size              = 8.52211548825356E-06;
+	fy_document_destroy(fyd);
 
-	// the size (in pixels) of resulting image, where image coordinates range -image_size/2 to +image_size/2
-	config->image_size             = 2048.0;
+	config->render_size = config->image_size;
+	config->x_render_offset = 0;
+	config->y_render_offset = 0;
+	config->num_baselines = (num_receivers*(num_receivers-1))/2;
 
-	// if the image is too big, can specify a subregion where x_render and y_render offsets are the bottom corner of image
-	// and render_size the amount of pixels from those coordinates in each direction you want your image. 0,0 is middle of image.
-	config->render_size            = 2048;
-	config->x_render_offset        = -(config->image_size / 2);
-	config->y_render_offset        = -(config->image_size / 2);
-
-	// Set the data to be right ascension, flips the u and w coordinate.
-	config->enable_right_ascension = true;
-
-	// set amount of visibilities per batch size, use 0 for no batching..
-	// Will do a remainder batch if visibility count not divisible by batch size
-	config->vis_batch_size         = 100000;
-
-	// Max number of threads per block dimension. Note this is 2D problem,
-	// so actual number of full threads per block is this value squared.
-	// i.e: 32^2 = 1024 threads per block - this is GPU specific.
-	config->gpu_num_threads_per_block_dimension = 32;
+	config->num_uvw_coords = config->num_baselines * config->num_timesteps;
+	config->num_visibilities = config->num_uvw_coords * config->num_channels;
+	config->cell_size_rads = asin(2.0 * sin(0.5 * config->fov_deg*PI/(180.0)) / (double)config->image_size);
 }
 
-/*
- * Function that performs iDFT on the GPU using CUDA, using visibilities (uvw) and their intensity
- * (real, imaginary) in the fourier domain to obtain sources in the image domain
- */
-void create_perfect_image(Config *config, Complex *grid, Visibility *visibilities, Complex *vis_intensity)
+void parse_config_attribute(struct fy_document *fyd, const char *attrib_name, const char *format, void* data)
+{
+	char buffer[MAX_CHARS];
+	snprintf(buffer, MAX_CHARS, "/%s %s", attrib_name, format);
+
+	if(fy_document_scanf(fyd, buffer, data))
+	{
+		printf("Successfully parsed attribute %s...\n\n", attrib_name);
+	}
+	else
+	{
+		printf("Error: unable to find attribute %s in yaml config file...\n\n", attrib_name);
+		exit(EXIT_FAILURE);
+	}
+}
+
+void parse_config_attribute_bool(struct fy_document *fyd, const char *attrib_name, const char *format, bool* data)
+{
+	int obtained = 0;
+	parse_config_attribute(fyd, attrib_name, format, &obtained);
+	*data = (obtained == 1) ? true : false;
+}
+
+
+
+void create_image(Config *config, PRECISION *h_image, VIS_PRECISION2 *h_visibilities, PRECISION3 *h_uvw_coords)
 {
 	printf(">>> UPDATE:  Configuring iDFT and allocating GPU memory for grid (image)...\n\n");
 
-	// Pointers for GPU memory
-	double2 *d_g;
-	double3 *v_k;
-	double2 *vi_k;
 
-	// use pitch to align data on GPU
-	size_t g_pitch;
-	CUDA_CHECK_RETURN(cudaMallocPitch(&d_g, &g_pitch, config->render_size * sizeof(Complex), config->render_size));
+	uint32_t vis_batch_size = config->num_baselines * config->num_channels  * config->ts_batch_size;
+	uint32_t uvw_batch_size = config->num_baselines * config->ts_batch_size;
 
-	// copy grid (image) to GPU using pitch
-	CUDA_CHECK_RETURN((cudaMemcpy2D(d_g, g_pitch, grid, config->render_size * sizeof(Complex),
-		config->render_size * sizeof(Complex), config->render_size, cudaMemcpyHostToDevice)));
 
-	int max_threads_per_block_dim = min(config->gpu_num_threads_per_block_dimension, config->render_size);
-	int num_blocks = (int) ceil((double) config->render_size / max_threads_per_block_dim);
-	dim3 kernel_blocks(num_blocks, num_blocks, 1);
-	dim3 kernel_threads(max_threads_per_block_dim, max_threads_per_block_dim, 1);
 
-	// calculate number of batches and determine any remainder visibilities
-	int number_of_batches = 1;
-	int visibilities_on_last_batch = 0;
-	int visibilities_per_batch = config->vis_count;
-	if(config->vis_batch_size > 0)
-	{ 	
-		number_of_batches = config->vis_count/config->vis_batch_size;
-		visibilities_on_last_batch = config->vis_count % config->vis_batch_size;
-		visibilities_per_batch = config->vis_batch_size;
+	PRECISION *d_image;
+	VIS_PRECISION2 *d_visibilities;
+	PRECISION3 *d_uvw_coords;
+
+	CUDA_CHECK_RETURN(cudaMalloc(&(d_visibilities), sizeof(VIS_PRECISION2) * vis_batch_size));
+	CUDA_CHECK_RETURN(cudaMalloc(&(d_uvw_coords), sizeof(PRECISION3) * uvw_batch_size));
+	CUDA_CHECK_RETURN(cudaMalloc(&d_image, sizeof(PRECISION) * config->render_size*config->render_size));
+
+
+	uint32_t total_num_batches = (int)CEIL(double(config->num_timesteps) / double(config->ts_batch_size));
+		
+	uint32_t visLeftToProcess = config->num_visibilities;
+	uint32_t uwvLeftToProcess = config->num_uvw_coords;
+
+
+	PRECISION freq_inc = 0.0;
+	if(config->num_channels > 1)
+		freq_inc = PRECISION(config->frequency_bandwidth) / (config->num_channels-1); 
+
+
+
+	int max_threads_per_block = min(1024, config->render_size*config->render_size);
+	int num_blocks = (int) ceil((double) (config->render_size*config->render_size) / max_threads_per_block);
+	printf("Max threads per block: %d\n", max_threads_per_block);
+	printf("Num blocks: %d\n", num_blocks);
+	dim3 kernel_blocks(num_blocks, 1, 1);
+	dim3 kernel_threads(max_threads_per_block, 1, 1);
+
+
+
+
+
+	for(uint32_t ts_batch=0;ts_batch<total_num_batches; ts_batch++)
+	{	//copy vis UVW here
+		//fill UVW and VIS
+		printf("Gridding batch number %d of %d batches...\n",ts_batch, total_num_batches);
+
+		uint32_t current_vis_batch_size = min(visLeftToProcess, vis_batch_size);
+		uint32_t current_uvw_batch_size = min(uwvLeftToProcess, uvw_batch_size);
+		printf("Number of Visibilities %d and UVW %d to process...\n",current_vis_batch_size, current_uvw_batch_size);
+
+
+		CUDA_CHECK_RETURN(cudaMemcpy(d_visibilities, h_visibilities+(ts_batch*vis_batch_size), 
+				sizeof(VIS_PRECISION2) * current_vis_batch_size, cudaMemcpyHostToDevice));
+		CUDA_CHECK_RETURN(cudaMemcpy(d_uvw_coords, h_uvw_coords+(ts_batch*uvw_batch_size), 
+			   sizeof(PRECISION3) * current_uvw_batch_size, cudaMemcpyHostToDevice));
+
+		//grid me.
+		
+
+
+		direct_imaging_with_w_correction<<<kernel_blocks, kernel_threads>>>(
+ 			d_image,
+			config->image_size,
+			config->cell_size_rads,
+ 			d_visibilities,
+			current_vis_batch_size,
+			d_uvw_coords,
+ 			current_uvw_batch_size,
+			config->frequency_hz_start,
+			freq_inc,
+ 			config->num_channels,
+			config->num_baselines
+		);
+
+
+
+		CUDA_CHECK_RETURN( cudaGetLastError() );
+		CUDA_CHECK_RETURN( cudaDeviceSynchronize() );
+
+
+		visLeftToProcess -= current_vis_batch_size;
+		uwvLeftToProcess -= current_uvw_batch_size;
+		printf("Number of Visibilities %d and UVW %d remaining...\n\n",visLeftToProcess, uwvLeftToProcess);
+
 	}
 
-	printf(">>> UPDATE: Setting %d batches of %d visibilities with a possible remainder batch of %d...\n\n",
-			number_of_batches, visibilities_per_batch, visibilities_on_last_batch);
-	
-	// allocate CUDA memory for visibility data
-	printf(">>> UPDATE: Allocating GPU memory for visibilities...\n\n");
+	//TODO  batch via timesteps!;
 
-	CUDA_CHECK_RETURN(cudaMalloc(&v_k, visibilities_per_batch * sizeof(Visibility)));
 
-	CUDA_CHECK_RETURN(cudaMalloc(&vi_k,visibilities_per_batch * sizeof(Complex)));
 
-	// Perform iDFT on each batch
-	for(int i=0;i<number_of_batches;++i)
-	{	
-		int offset = i*	visibilities_per_batch;
-		printf(">>> UPDATE: Batch %d : %d visibilities sent to GPU...\n\n",(i+1), visibilities_per_batch);
 
-		CUDA_CHECK_RETURN(cudaMemcpy(v_k, visibilities+offset, visibilities_per_batch * sizeof(Visibility), cudaMemcpyHostToDevice));
+	CUDA_CHECK_RETURN( cudaDeviceSynchronize() );
 
-		CUDA_CHECK_RETURN(cudaMemcpy(vi_k, vis_intensity+offset, visibilities_per_batch  * sizeof(Complex), cudaMemcpyHostToDevice));
+    CUDA_CHECK_RETURN(cudaMemcpy(h_image, d_image, config->image_size*config->image_size * sizeof(PRECISION),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK_RETURN( cudaDeviceSynchronize() );
+	CUDA_CHECK_RETURN(cudaFree(d_image));
+	CUDA_CHECK_RETURN(cudaFree(d_visibilities));
 
-		cudaDeviceSynchronize();
+	printf("UPDATE SAVING IMAGE TO FILE ");
+	save_image_to_file(config, h_image);
 
-		printf(">>> UPDATE: Executing iDFT CUDA kernel...\n\n");
-
-		// iDFT performed on a portion of the image (assuming 0,0 in center of image), coordinates are from x and y render offset
-		// origin to render size - Image must be square
-		inverse_dft_with_w_correction<<<kernel_blocks, kernel_threads>>>(d_g, g_pitch, v_k, vi_k,
-			config->vis_count, visibilities_per_batch, config->x_render_offset,
-			config->y_render_offset, config->render_size, config->cell_size);
-		cudaDeviceSynchronize();
-
-		printf(">>> UPDATE: Completed %d batch \n\n",(i+1));
-	}
-
-	// Perform iDFT on any remainder visibility data
-	if(visibilities_on_last_batch > 0)
-	{
-		printf(">>> UPDATE: Sending %d remaining visibilities for final processing...  \n\n",  visibilities_on_last_batch);
-		int offset = number_of_batches * visibilities_per_batch;
-		printf(">>> UPDATE: final batch of %d visibilities sent to GPU...\n\n", visibilities_on_last_batch);
-
-		CUDA_CHECK_RETURN(cudaMemcpy(v_k, (Visibility*)visibilities + offset,
-			visibilities_on_last_batch * sizeof(Visibility), cudaMemcpyHostToDevice));
-
-		CUDA_CHECK_RETURN(cudaMemcpy(vi_k, (Complex*)vis_intensity + offset,
-			visibilities_on_last_batch  * sizeof(Complex), cudaMemcpyHostToDevice));
-
-		cudaDeviceSynchronize();
-
-		printf(">>> UPDATE: Executing final iDFT CUDA kernel call...\n\n");
-		inverse_dft_with_w_correction<<<kernel_blocks, kernel_threads>>>(d_g, g_pitch, v_k, vi_k,
-			config->vis_count, visibilities_on_last_batch, config->x_render_offset,
-			config->y_render_offset, config->render_size, config->cell_size);
-		cudaDeviceSynchronize();
-	}
-
-	// copy image data back from the GPU to CPU
-	printf(">>> UPDATE: Batch processing complete...  \n\n");
-	printf(">>> UPDATE: Copying image data from GPU back to host...\n\n");
-	CUDA_CHECK_RETURN(cudaMemcpy2D(grid, config->render_size * sizeof(double2), d_g, g_pitch,
-		config->render_size * sizeof(double2),
-		config->render_size, cudaMemcpyDeviceToHost));
-	cudaDeviceSynchronize();
-
-	printf(">>> UPDATE: Cleaning up allocated GPU memory...\n\n");
-	CUDA_CHECK_RETURN(cudaFree(d_g));
-	CUDA_CHECK_RETURN(cudaFree(v_k));
-	CUDA_CHECK_RETURN(cudaFree(vi_k));
 }
 
-// Populates visibility array from file
-void load_visibilities(Config *config, Visibility **visibilities, Complex **vis_intensity)
+__global__ void direct_imaging_with_w_correction(
+	PRECISION *image, 
+	const uint32_t image_size,
+	const PRECISION cell_size_rads, 
+	const VIS_PRECISION2 *visibilities,
+	const uint32_t num_visibilities, 
+	const PRECISION3 *uvw_coords,
+	const uint32_t num_uvw_coords,
+	const PRECISION frequency_hz_start, 
+	const PRECISION bandwidth_increment,
+	const uint32_t num_channels,
+	const uint32_t num_baselines	
+)
 {
-	printf(">>> UPDATE: Loading Visibilities from File: %s ...\n\n", config->vis_file);
-	FILE *file = fopen(config->vis_file, "r");
-
-	if(file == NULL)
-	{
-		printf(">>> ERROR: Unable to load sources from file...\n\n");
+	uint32_t pixel_index = blockIdx.x*blockDim.x + threadIdx.x;
+	if(pixel_index >= (image_size*image_size))
 		return;
-	}
-	else
-	{	// read the amount of visibilities in file
-		fscanf(file, "%d\n", &(config->vis_count));
 
-		// allocate visibility u,v,w and associated intensity value
-		*visibilities = (Visibility*) calloc(config->vis_count, sizeof(Visibility));
-		*vis_intensity = (Complex*) calloc(config->vis_count, sizeof(Complex));
-		if(*visibilities == NULL || *vis_intensity == NULL) 
-		{	
-			fclose(file);
-			return;
-		}
+	PRECISION x = ((int32_t)(pixel_index % image_size) - (int32_t)image_size/2) * cell_size_rads;
+    PRECISION y = ((int32_t)(pixel_index / image_size) - (int32_t)image_size/2) * cell_size_rads;
 
-		double wavelength_factor = config->frequency_hz / C;
-		double temp_uu     = 0.0;
-		double temp_vv     = 0.0; 
-		double temp_ww     = 0.0;
-		double temp_real   = 0.0;
-		double temp_imag   = 0.0; 
-		double temp_weight = 0.0;
+	PRECISION image_correction = SQRT(1.0f - (x * x) - (y * y));
+	PRECISION w_correction = image_correction - 1.0f;
 
-		double right_asc_factor = (config->enable_right_ascension) ? -1.0 : 1.0;
+    PRECISION2 theta_complex = MAKE_PRECISION2(0.0, 0.0);
+	PRECISION3 uvw_coord = MAKE_PRECISION3(0.0, 0.0, 0.0);
 
-		for(int i = 0; i < config->vis_count; i++)
-		{
-			fscanf(file, "%lf %lf %lf %lf %lf %lf\n", &temp_uu, &temp_vv, &temp_ww,
-				&temp_real, &temp_imag, &temp_weight);
+    PRECISION theta_vis_product = 0.0f;
+	PRECISION sum = 0.0f;
+	
+	//TOdo update
+	for(uint32_t v = 0; v < num_visibilities; v++)
+	{
+		//convert to meters_wavelengths
+		uint32_t timeStepOffset = v/(num_channels*num_baselines);
+		uint32_t uvwIndex = (v % num_baselines) + (timeStepOffset*num_baselines);
+		PRECISION3 local_uvw = uvw_coords[uvwIndex];	
+		//chnnelNum - visIndex 
+		uint32_t channelNumber = (v / num_baselines) % num_channels; 
+		
+		PRECISION freqScale = (frequency_hz_start + channelNumber*bandwidth_increment) / PRECISION(SPEED_OF_LIGHT); //meters to wavelengths conversion
+		local_uvw.x *= freqScale;
+		local_uvw.y *= freqScale;
+		local_uvw.z *= freqScale;
 
-			// Flip u and v coordinate if data should be right ascension
-			temp_uu = temp_uu * right_asc_factor;
-			temp_ww = temp_ww * right_asc_factor;
+		PRECISION theta = 2.0f * PI * (x * local_uvw.x + y * local_uvw.y - (w_correction * local_uvw.z));
+		SINCOS(theta, &(theta_complex.y), &(theta_complex.x));
+		theta_vis_product = complex_to_real_mult(MAKE_PRECISION2(visibilities[v].x,visibilities[v].y), theta_complex);
+		sum += theta_vis_product;
 
-			// use weight to adjust the real, imag or set real to one if psf enabled
-			if(config->psf_enabled)
-			{
-				temp_real = 1.0;
-				temp_imag = 0.0;
-			}
-			else
-			{	temp_real = temp_real * 1.0;//temp_weight;
-				temp_imag = temp_imag * 1.0;//temp_weight;
-			}
-			// convert uvw from meters to wavelengths
-			temp_uu = temp_uu * wavelength_factor;
-			temp_vv = temp_vv * wavelength_factor;
-			temp_ww = temp_ww * wavelength_factor;
-
-			(*visibilities)[i] = (Visibility){.u = temp_uu, .v = temp_vv, .w = temp_ww};
-			(*vis_intensity)[i] = (Complex){.real = temp_real, .imaginary = temp_imag};
-		}
-
-		fclose(file);
-		printf(">>> UPDATE: Successfully read %d visibilities from file...\n\n",config->vis_count);
 	}
 
+	image[pixel_index] += (sum * image_correction);
 }
 
+
+
+void load_visibilities(Config *config, VIS_PRECISION2 *h_visibilities, PRECISION3 *h_uvw_coords)
+{
+	char vis_file_location[MAX_CHARS*2];
+	snprintf(vis_file_location, MAX_CHARS*2, "%s%s", config->data_input_path, config->visibility_source_file);
+	char uvw_file_location[MAX_CHARS*2];
+	snprintf(uvw_file_location, MAX_CHARS*2, "%s%s", config->data_input_path, config->uvw_source_file);
+
+	FILE *vis_file = fopen(vis_file_location, "rb");
+	FILE *uvw_file = fopen(uvw_file_location, "rb");
+
+	uint32_t num_vis_header = 0;
+    fread(&num_vis_header, sizeof(uint32_t), 1, vis_file);
+	uint32_t num_uvw_header = 0;
+    fread(&num_uvw_header, sizeof(uint32_t), 1, uvw_file);
+
+    if(num_vis_header < config->num_visibilities || num_uvw_header < config->num_uvw_coords)
+    {
+    	printf("Error: the file headers for visibilities/uvw coords does not match calculations based on yaml file...\n\n");
+    	exit(EXIT_FAILURE);
+    }
+    
+    if(num_vis_header > config->num_visibilities || num_uvw_header > config->num_uvw_coords)
+    {
+    	printf("Warning: the file headers for visibilities/uvw coords are greater than the amount of calculated vis/uvw...\n\n");
+    }
+
+    uint32_t num_vis_read = fread(h_visibilities, sizeof(VIS_PRECISION2), config->num_visibilities, vis_file);
+    uint32_t num_uvw_read = fread(h_uvw_coords, sizeof(PRECISION3), config->num_uvw_coords, uvw_file);
+
+    if(num_vis_read != config->num_visibilities || num_uvw_read != config->num_uvw_coords)
+    {
+    	printf("Error: number of visibilities read from file failed, check your precision types...\n\n");
+    	exit(EXIT_FAILURE);
+    }
+
+    // PRECISION right_ascension = (PRECISION)(config->right_ascension ? -1.0 : 1.0);
+     for(uint32_t coord = 0; coord < config->num_uvw_coords; coord++)
+     {
+     	//h_uvw_coords[coord].x *= -1.0;
+     	//h_uvw_coords[coord].z *= -1.0;
+     }
+
+	fclose(vis_file);
+	fclose(uvw_file);
+
+	// TESTING...
+	// for(int i = 0; i < 10; i++)
+	// {
+	// 	printf("UVW => Vis: (%f %f %f) => %f %f\n", h_uvw_coords[i].x, h_uvw_coords[i].y, h_uvw_coords[i].z,
+	// 		h_visibilities[i].x, h_visibilities[i].y);
+	// }
+}
 
 // saves a csv file of the rendered iDFT region only
-void save_grid_to_file(Config *config, Complex *grid)
+void save_image_to_file(Config *config, PRECISION *h_image)
 {
-    FILE *file_real = fopen(config->output_image_file, "w");
-    double real_sum = 0.0;
-    double imag_sum = 0.0;
+	char buffer[MAX_CHARS * 2];
+	snprintf(buffer, MAX_CHARS*2, "%sdirect_image.bin", config->data_output_path);
 
-    if(!file_real)
-	{	
-		printf(">>> ERROR: Unable to create grid file %s, check file structure exists...\n\n",
-			config->output_image_file);
-		return;
-	}
-
-    for(unsigned int r= 0; r < config->render_size; r++)
-    {
-    	for(unsigned int c = 0; c < config->render_size; c++)
-        {
-            Complex grid_point = grid[r*config->render_size+c];
-
-            if(c<(config->render_size-1))
-            	fprintf(file_real, "%.15f ", grid_point.real);
-            else
-            	fprintf(file_real, "%.15f", grid_point.real);
-
-            real_sum += grid_point.real;
-            imag_sum += grid_point.imaginary;
-        }
-
-        fprintf(file_real, "\n");
-    }
-    fclose(file_real);
-
-    printf(">>> UPDATE: RealSum: %f, ImagSum: %f...\n\n", real_sum, imag_sum);
+	FILE *f = fopen(buffer, "wb");
+	int saved = fwrite(h_image, sizeof(PRECISION), config->image_size * config->image_size, f);
+	printf(">>> GRID DIMS IS : %d\n", config->image_size);
+	printf(">>> SAVED TO FILE: %d\n", saved);
+    fclose(f);
 }
 
+
+
+/*
 // visibilities (x,y,z) = (uu,vv,ww), visIntensity (x,y) = (real, imaginary), grid (x,y) = (real, imaginary)
 __global__ void inverse_dft_with_w_correction(double2 *grid, size_t grid_pitch, const double3 *visibilities,
 		const double2 *vis_intensity, int vis_count, int batch_count, int x_offset, int y_offset,
@@ -359,126 +408,16 @@ __global__ void inverse_dft_with_w_correction(double2 *grid, size_t grid_pitch, 
 	row[idx].x += (real_sum / vis_count);
 	row[idx].y += (imag_sum / vis_count);
 }
+*/
 
 // done on GPU, performs a complex multiply of two complex numbers
-__device__ double2 complex_multiply(double2 z1, double2 z2)
+__device__ PRECISION complex_to_real_mult(PRECISION2 z1, PRECISION2 z2)
 {
-    double real = z1.x*z2.x - z1.y*z2.y;
-    double imag = z1.y*z2.x + z1.x*z2.y;
-    return make_double2(real, imag);
+    return z1.x*z2.x - z1.y*z2.y;
 }
 
 // used for performance testing to return the difference in milliseconds between two timeval structs
 float time_difference_msec(struct timeval t0, struct timeval t1)
 {
     return (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_usec - t0.tv_usec) / 1000.0f;
-}
-
-
-//**************************************//
-//      UNIT TESTING FUNCTIONALITY      //
-//**************************************//
-
-void unit_test_init_config(Config *config)
-{	
-	config->output_image_file      = "../unit_test_500_sources_1024_grid_real.csv";
-	config->vis_file               = "../unit_test_visibilities_500_sources.txt";
-	config->psf_enabled            = false;
-	config->frequency_hz           = 300e06;
-	config->cell_size              = 4.848136811095360e-06;
-	config->image_size             = 1024.0;
-	config->render_size            = 1024;
-	config->x_render_offset        = -512;
-	config->y_render_offset        = -512;
-	config->enable_right_ascension = false;
-	config->vis_batch_size         = 0;
-	config->gpu_num_threads_per_block_dimension = 32;
-}
-
-double unit_test_generate_approximate_image()
-{
-	// used to invalidate unit test
-	double error = DBL_MAX;
-
-	// Init config
-	Config config;
-	unit_test_init_config(&config);
-
-	// Allocate grid mem
-	Complex *grid = (Complex*) calloc(config.render_size * config.render_size, sizeof(Complex));
-	if(grid == NULL)
-	{	
-		printf(">>> ERROR: Unable to allocate grid memory \n");
-		return error;
-	}
-
-	// Read visibilities into memory
-	Visibility *visibilities = NULL;
-	Complex *vis_intensity = NULL;
-	load_visibilities(&config, &visibilities, &vis_intensity);
-
-	if(visibilities == NULL || vis_intensity == NULL)
-	{	
-		printf(">>> ERROR: Visibility memory was unable to be allocated \n\n");
-		if(visibilities)      free(visibilities);
-		if(vis_intensity)      free(vis_intensity);
-		if(grid)			  free(grid);
-		return error;
-	}
-
-	// Begin primitive timing...
-	 struct timeval begin;
-	gettimeofday(&begin,0);
-
-	//Pefrom iDFT to obtain sources from visibility data
-	create_perfect_image(&config, grid, visibilities, vis_intensity);
-	
-	// End primitive timing...
-	 struct timeval end;
-	 gettimeofday(&end,0);
-	float time_diff = time_difference_msec(begin,end);
-	 printf(">>> UPDATE: iDFT complete, time taken %f milliseconds or %f seconds\n\n",time_diff, time_diff/1000);
-
-	// Compare image with "output image"
-	FILE *file = fopen(config.output_image_file, "r");
-	if(file == NULL)
-	{
-		printf(">>> ERROR: Unable to open unit test file %s...\n\n", config.output_image_file);
-	    if(visibilities)      free(visibilities);
-		if(vis_intensity)     free(vis_intensity);
-		if(grid)			  free(grid);
-		return error;
-	}
-
-	// Perform analysis
-	double difference = 0.0;
-	double file_image_element = 0.0;
-	double bottom = 0.0;
-	for(int row_indx = 0; row_indx < config.render_size; ++row_indx)
-	{
-		for(int col_indx = 0; col_indx < config.render_size; ++col_indx)
-		{
-			int lookup_indx = row_indx * config.render_size + col_indx;
-
-			if(col_indx < config.render_size-1)
-				fscanf(file, "%lf,", &file_image_element);
-			else
-				fscanf(file, "%lf", &file_image_element);
-			
-			difference += pow(file_image_element - grid[lookup_indx].real,2.0);
-			bottom += pow(file_image_element,2.0);
-		}
-		fscanf(file, "\n");
-	}
-
-	difference = sqrt(difference) / sqrt(bottom);
-	fclose(file);
-
-	// clean up
-    if(visibilities)      free(visibilities);
-	if(vis_intensity)     free(vis_intensity);
-	if(grid)			  free(grid);
-
-	printf(">>> INFO: Measured absolute difference across full image: %lf...\n\n", difference);
-	return difference;
 }
