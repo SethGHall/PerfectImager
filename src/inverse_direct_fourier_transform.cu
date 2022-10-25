@@ -93,9 +93,15 @@ void init_config_from_yaml(Config *config, char* yaml_file)
 
 	fy_document_destroy(fyd);
 
+	/*  DEFAULTS
 	config->render_size = config->image_size;
-	config->x_render_offset = 0;
-	config->y_render_offset = 0;
+	config->x_render_offset = -config->image_size/2;
+	config->y_render_offset = -config->image_size/2;
+	*/ 
+	config->render_size = config->image_size;
+	config->x_render_offset = -(config->image_size/2);
+	config->y_render_offset = -(config->image_size/2);
+
 	config->num_baselines = (num_receivers*(num_receivers-1))/2;
 
 	config->num_uvw_coords = config->num_baselines * config->num_timesteps;
@@ -159,6 +165,13 @@ void create_image(Config *config, PRECISION *h_image, VIS_PRECISION2 *h_visibili
 
 
 
+
+	//DON"T TOUCH LEAVE AS DEFAULTS COMMENTED
+	//int x_offset = -config->image_size/2;
+	//int y_offset = -config->image_size/2;
+	//int render_size = config->image_size;
+
+
 	int max_threads_per_block = min(1024, config->render_size*config->render_size);
 	int num_blocks = (int) ceil((double) (config->render_size*config->render_size) / max_threads_per_block);
 	printf("Max threads per block: %d\n", max_threads_per_block);
@@ -167,7 +180,8 @@ void create_image(Config *config, PRECISION *h_image, VIS_PRECISION2 *h_visibili
 	dim3 kernel_threads(max_threads_per_block, 1, 1);
 
 
-
+	printf("CREATING IMAGE OF %d with offset x = %d and y = %d ",config->render_size, 
+			config->x_render_offset, config->y_render_offset);
 
 
 	for(uint32_t ts_batch=0;ts_batch<total_num_batches; ts_batch++)
@@ -187,11 +201,12 @@ void create_image(Config *config, PRECISION *h_image, VIS_PRECISION2 *h_visibili
 
 		//grid me.
 		
-
-
+		
 		direct_imaging_with_w_correction<<<kernel_blocks, kernel_threads>>>(
  			d_image,
-			config->image_size,
+			config->render_size,
+			config->x_render_offset,
+			config->y_render_offset,
 			config->cell_size_rads,
  			d_visibilities,
 			current_vis_batch_size,
@@ -222,7 +237,7 @@ void create_image(Config *config, PRECISION *h_image, VIS_PRECISION2 *h_visibili
 
 	CUDA_CHECK_RETURN( cudaDeviceSynchronize() );
 
-    CUDA_CHECK_RETURN(cudaMemcpy(h_image, d_image, config->image_size*config->image_size * sizeof(PRECISION),
+    CUDA_CHECK_RETURN(cudaMemcpy(h_image, d_image, config->render_size*config->render_size * sizeof(PRECISION),
         cudaMemcpyDeviceToHost));
     CUDA_CHECK_RETURN( cudaDeviceSynchronize() );
 	CUDA_CHECK_RETURN(cudaFree(d_image));
@@ -235,7 +250,9 @@ void create_image(Config *config, PRECISION *h_image, VIS_PRECISION2 *h_visibili
 
 __global__ void direct_imaging_with_w_correction(
 	PRECISION *image, 
-	const uint32_t image_size,
+	const uint32_t render_size,
+	const int32_t x_offset,
+	const int32_t y_offset,
 	const PRECISION cell_size_rads, 
 	const VIS_PRECISION2 *visibilities,
 	const uint32_t num_visibilities, 
@@ -248,11 +265,34 @@ __global__ void direct_imaging_with_w_correction(
 )
 {
 	uint32_t pixel_index = blockIdx.x*blockDim.x + threadIdx.x;
-	if(pixel_index >= (image_size*image_size))
+	if(pixel_index >= (render_size*render_size))
 		return;
 
-	PRECISION x = ((int32_t)(pixel_index % image_size) - (int32_t)image_size/2) * cell_size_rads;
-    PRECISION y = ((int32_t)(pixel_index / image_size) - (int32_t)image_size/2) * cell_size_rads;
+
+	int32_t idx = (int32_t)(pixel_index % render_size);
+	int32_t idy = (int32_t)(pixel_index / render_size);
+
+	PRECISION x = (idx + x_offset)*cell_size_rads;
+	PRECISION y = (idy + y_offset)*cell_size_rads;
+
+	//PRECISION x = ((int32_t)(pixel_index % render_size) - (int32_t)render_size/2) * cell_size_rads;
+    //PRECISION y = ((int32_t)(pixel_index / render_size) - (int32_t)render_size/2) * cell_size_rads;
+
+	/*
+	int idx = blockIdx.x*blockDim.x + threadIdx.x;
+	int idy = blockIdx.y*blockDim.y + threadIdx.y;
+
+	if(idx >= render_size || idy >= render_size)
+		return;
+
+
+	// convert to x and y image coordinates
+	double x = (idx+x_offset) * cell_size;
+    double y = (idy+y_offset) * cell_size;
+	
+	*/
+
+
 
 	PRECISION image_correction = SQRT(1.0f - (x * x) - (y * y));
 	PRECISION w_correction = image_correction - 1.0f;
@@ -350,8 +390,8 @@ void save_image_to_file(Config *config, PRECISION *h_image)
 	snprintf(buffer, MAX_CHARS*2, "%sdirect_image.bin", config->data_output_path);
 
 	FILE *f = fopen(buffer, "wb");
-	int saved = fwrite(h_image, sizeof(PRECISION), config->image_size * config->image_size, f);
-	printf(">>> GRID DIMS IS : %d\n", config->image_size);
+	int saved = fwrite(h_image, sizeof(PRECISION), config->render_size * config->render_size, f);
+	printf(">>> GRID DIMS IS : %d\n", config->render_size);
 	printf(">>> SAVED TO FILE: %d\n", saved);
     fclose(f);
 }

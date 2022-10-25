@@ -170,8 +170,8 @@ typedef struct Config {
     uint32_t num_uvw_coords;
 	uint32_t image_size;
 	uint32_t render_size;
-	uint32_t x_render_offset;
-	uint32_t y_render_offset;
+	int32_t x_render_offset;
+	int32_t y_render_offset;
 	uint32_t num_channels;
 	uint32_t num_baselines;
 	uint32_t num_timesteps;
@@ -206,7 +206,9 @@ void create_image(Config *config, PRECISION *h_image, VIS_PRECISION2 *h_visibili
 
 __global__ void direct_imaging_with_w_correction(
 	PRECISION *image, 
-	const uint32_t image_size,
+	const uint32_t render_size,
+	const int32_t x_offset,
+	const int32_t y_offset,
 	const PRECISION cell_size_rads, 
 	const VIS_PRECISION2 *visibilities,
 	const uint32_t num_visibilities, 
