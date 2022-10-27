@@ -74,8 +74,8 @@ extern "C" {
 #endif
 
 #ifndef COMPUTE_PRECISION
-    #define COMPUTE_PRECISION SINGLE
-    //#define COMPUTE_PRECISION DOUBLE
+    //#define COMPUTE_PRECISION SINGLE
+    #define COMPUTE_PRECISION DOUBLE
 #endif
 
 #ifndef VISIBILITY_PRECISION

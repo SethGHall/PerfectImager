@@ -163,14 +163,10 @@ void create_image(Config *config, PRECISION *h_image, VIS_PRECISION2 *h_visibili
 	if(config->num_channels > 1)
 		freq_inc = PRECISION(config->frequency_bandwidth) / (config->num_channels-1); 
 
-
-
-
-	//DON"T TOUCH LEAVE AS DEFAULTS COMMENTED
+    //DON"T TOUCH LEAVE AS DEFAULTS COMMENTED
 	//int x_offset = -config->image_size/2;
 	//int y_offset = -config->image_size/2;
 	//int render_size = config->image_size;
-
 
 	int max_threads_per_block = min(1024, config->render_size*config->render_size);
 	int num_blocks = (int) ceil((double) (config->render_size*config->render_size) / max_threads_per_block);
@@ -356,8 +352,26 @@ void load_visibilities(Config *config, VIS_PRECISION2 *h_visibilities, PRECISION
     	printf("Warning: the file headers for visibilities/uvw coords are greater than the amount of calculated vis/uvw...\n\n");
     }
 
-    uint32_t num_vis_read = fread(h_visibilities, sizeof(VIS_PRECISION2), config->num_visibilities, vis_file);
-    uint32_t num_uvw_read = fread(h_uvw_coords, sizeof(PRECISION3), config->num_uvw_coords, uvw_file);
+	float2 *tempVisBuffer = (float2*) calloc(config->num_visibilities, sizeof(float2));
+	uint32_t num_vis_read = fread(tempVisBuffer, sizeof(float2), config->num_visibilities, vis_file);
+	
+	for(uint32_t i=0;i<num_vis_read;i++)
+	{	
+		h_visibilities[i].x = (VIS_PRECISION)tempVisBuffer[i].x;
+		h_visibilities[i].y = (VIS_PRECISION)tempVisBuffer[i].y;
+	}
+	free(tempVisBuffer);
+
+
+	float3 *tempUVWBuffer = (float3*) calloc(config->num_uvw_coords, sizeof(float3));
+	uint32_t num_uvw_read = fread(tempUVWBuffer, sizeof(float3), config->num_uvw_coords, uvw_file);
+	for(uint32_t i=0;i<num_uvw_read;i++)
+	{	
+		h_uvw_coords[i].x = (PRECISION)tempUVWBuffer[i].x;
+		h_uvw_coords[i].y = (PRECISION)tempUVWBuffer[i].y;
+		h_uvw_coords[i].z = (PRECISION)tempUVWBuffer[i].z;
+	}
+	free(tempUVWBuffer);
 
     if(num_vis_read != config->num_visibilities || num_uvw_read != config->num_uvw_coords)
     {
