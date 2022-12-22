@@ -1,5 +1,5 @@
 
-// Copyright 2019 Adam Campbell, Seth Hall, Andrew Ensor
+// Copyright Seth Hall
 // Copyright 2019 High Performance Computing Research Laboratory, Auckland University of Technology (AUT)
 
 // Redistribution and use in source and binary forms, with or without
